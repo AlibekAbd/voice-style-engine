@@ -7,6 +7,7 @@
 from datetime import datetime, timezone
 
 from .. import telegram
+from . import tg
 from .common import (
     DAYS,
     FETCH_STATE,
@@ -46,7 +47,7 @@ async def _collect(app, targets, state, since, notify=say):
             continue
         head = f"[{number}/{len(targets)}] {title}"
         try:
-            rows = await telegram.speech(
+            rows = await tg.speech(
                 app,
                 target["entity"],
                 since=since,
@@ -292,7 +293,7 @@ async def lengths():
         done = 0
         for path, record, ids in work:
             entity = await telegram.entity_by_id(app, int(record["meta"]["id"]))
-            found = await telegram.lengths(app, entity, ids, notify=say)
+            found = await tg.lengths(app, entity, ids, notify=say)
             _lay(record["messages"], ids, found)
             write_json(path, record)
             done += len(found)

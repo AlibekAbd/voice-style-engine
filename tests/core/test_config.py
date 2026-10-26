@@ -71,16 +71,11 @@ def test_require_returns_values_in_key_order():
     assert config.require({"A": "1", "B": "2"}, ["B", "A"]) == ["2", "1"]
 
 
-def test_only_the_strong_model_is_configured():
-    """Слабая модель ушла из прохода А целиком: обе постановки задачи идут сильной."""
-    assert config.MODEL_PRO
-    assert not hasattr(config, "MODEL_FLASH")
-
-
-def test_roster_lies_next_to_the_dump_index():
-    """Постоянный рабочий список — такой же файл прогона, как индекс выгрузки."""
-    assert config.ROSTER.parent == config.OUT
-    assert config.ROSTER.name.endswith(".json")
+def test_core_config_carries_no_order_paths():
+    """Пути и модель заказов живут в `discovery.settings`; ядро о них не знает."""
+    for name in ("DUMP", "READ", "INDEX", "ROSTER", "REGISTRY", "STATE", "USAGE",
+                 "PRICES", "MODEL_PRO"):
+        assert not hasattr(config, name), name
 
 
 def test_env_path_stops_at_repository_root(tmp_path, monkeypatch):

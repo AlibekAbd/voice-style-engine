@@ -1,27 +1,27 @@
-"""Пути, ключи и имена моделей."""
+"""Пути, ключи и имена моделей ядра.
+
+Пути и модель заказов — в `tgservice/discovery/settings.py`.
+"""
 
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 CODE_DIR = PACKAGE_DIR.parent
 OUT = CODE_DIR / "out"
-DUMP = OUT / "dump"
-READ = OUT / "read"
 SESSION = CODE_DIR / "session" / "user"
-INDEX = OUT / "dump_index.json"
-# Постоянный рабочий список чатов: решение владельца о том, что взято в работу.
-# Живёт рядом с индексом, но переживает любую перевыгрузку — чат в нём опознаётся
-# идентификатором, а не местом в списке.
-ROSTER = OUT / "roster.json"
-# Реестр чатов: что уже смотрели и чем это кончилось. Переживает прогон, поэтому
-# лежит среди постоянных данных, а не в папке разведки.
-REGISTRY = OUT / "registry.json"
-META = OUT / "chat_meta.json"
-STATE = OUT / "state.json"
-USAGE = OUT / "usage.jsonl"
-PRICES = OUT / "prices.json"
+# Расшифровки голосовых: по файлу на чат, имя — идентификатор чата. Лежат рядом
+# с выгрузками, а не внутри них: выгрузку перезаписывает каждый прогон, а за
+# расшифровку заплачено, и терять её из-за перевыгрузки нельзя.
+SCRIBE = OUT / "scribe"
+SCRIBE_USAGE = OUT / "scribe_usage.jsonl"
+# Память отправки: боты-приманки, подтверждённые ответом, и журнал отправленных
+# писем. Читает и пишет их только `outbox`.
+BLACKLIST = OUT / "discovery" / "blacklist.json"
+OUTREACH = OUT / "discovery" / "outreach.jsonl"
 
-MODEL_PRO = "gemini-3.1-pro-preview"
+# Модель расшифровки. Scribe v2 сам определяет язык и держит смесь русского с
+# казахским, поэтому подсказка языка в запросе не ставится.
+MODEL_STT = "scribe_v2"
 
 
 def env_path():

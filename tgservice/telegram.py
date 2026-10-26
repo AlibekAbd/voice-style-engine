@@ -1,13 +1,21 @@
-"""Всё общение с Телеграмом. Про модели и разбор этот модуль ничего не знает.
+"""Доступ к Телеграму — ядро пакета. Про модели и разбор этот модуль ничего не знает.
 
-Наружу отдаются готовые строки выгрузки, списки чатов и понятные отказы:
-`SessionGone`, `FloodStop`, `SpamRestricted`, `ChatCapReached`. Трассировки
-Telethon до команд не доходят.
+Здесь сессия и вход, диалоги, чаты по юзернейму и по названию, папки,
+поиск, вступление и выход, голосовые для расшифровки. Чтение для заказов
+лежит в `discovery/tg.py`, для разбора манеры речи — в `voice/tg.py`,
+отправка — в `outbox.py`; все они опираются на этот модуль.
+
+Наружу отдаются списки чатов и понятные отказы: `SessionGone`, `FloodStop`,
+`SpamRestricted`, `ChatCapReached`. Трассировки Telethon до команд не
+доходят.
 """
 
 import asyncio
+import difflib
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -20,16 +28,10 @@ from telethon.errors import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl.functions.channels import (
-    GetFullChannelRequest,
-    JoinChannelRequest,
-    LeaveChannelRequest,
-)
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.messages import (
     GetDialogFiltersRequest,
-    GetForumTopicsRequest,
-    GetFullChatRequest,
     ImportChatInviteRequest,
     UpdateDialogFilterRequest,
 )
@@ -38,10 +40,6 @@ from telethon.tl.types import (
     ChannelForbidden,
     Chat,
     ChatForbidden,
-    MessageActionChannelMigrateFrom,
-    MessageActionChatMigrateTo,
-    PeerChannel,
-    PeerChat,
     User,
 )
 from telethon.utils import get_peer_id
@@ -54,13 +52,6 @@ CHAT_CAP = 500
 CAP_WARN = 25
 FLOOD_LIMIT = 300
 FLOOD_RETRIES = 5
-TOPIC_LIMIT = 100
-
-# Через сколько прочитанных сообщений обход подаёт голос.
-SPEECH_MARK = 5000
-
-# Сколько сообщений Телеграм отдаёт за один запрос по номерам.
-IDS_PER_CALL = 100
 
 # Сколько ждём, пока другая задача отпустит файл сессии.
 SESSION_WAIT = 30
@@ -79,34 +70,12 @@ SYSTEM = "Windows 11"
 # Автоматический набор папки: эти чаты попадают в неё сами, вручную их не добавляли.
 AUTO_SETS = ("contacts", "non_contacts", "groups", "broadcasts", "bots")
 
-# Где по чату виден отклик на заказ. Признак чата, а не сообщения: он один на всю
-# выгрузку и решается устройством чата.
-REPLIES_THREAD = "тред"  # обычная группа: отвечают прямо в тред
-REPLIES_COMMENTS = "комментарии"  # канал с группой обсуждения: отклики в комментариях
-REPLIES_NONE = "нет"  # канал без обсуждения: откликнуться в Телеграме негде
-
-# Можно ли в чате писать. Спрашивается до вступления: сходить в чат, где пишут
-# только админы, значит потратить время на то, чем нельзя воспользоваться.
-WRITE_OPEN = "можно"
-WRITE_JOIN = "после вступления"
-WRITE_ADMINS = "только админы"
-WRITE_BANNED = "участникам запрещено"
-
-# Сколько знаков закреплённого сообщения показываем: правила про рекламу занимают
-# абзац, а полотно на три экрана в справке о чате читать никто не станет.
-PINNED_LIMIT = 700
-
-
 class SessionGone(RuntimeError):
     """Сессия отозвана или её нет: нужен повторный вход."""
 
 
 class FloodStop(RuntimeError):
     """Телеграм просит ждать слишком долго: чат откладываем."""
-
-
-class KnownBot(RuntimeError):
-    """Адресат — бот-приманка из чёрного списка. Письмо ему не уходит."""
 
 
 class SpamRestricted(RuntimeError):
@@ -129,11 +98,21 @@ class ChatClosed(RuntimeError):
     """Чат есть, но без вступления Телеграм его не отдаёт."""
 
 
-class Rows(list):
-    """Строки выгрузки. Признаки миграции живут атрибутами рядом со списком."""
+class ChatNotFound(LookupError):
+    """Чата с таким названием в диалогах нет; похожий не подставляется."""
 
-    migrated_to = None
-    migrated_from = None
+
+class ChatAmbiguous(LookupError):
+    """Под одним названием несколько чатов: нужен номер вместе с названием."""
+
+
+@dataclass(frozen=True)
+class Чат:
+    """Адресат без юзернейма, найденный по названию в момент отправки."""
+
+    id: int
+    title: str
+    entity: object
 
 
 def _silent(text):
@@ -231,6 +210,68 @@ async def entity_by_id(app, chat_id):
         raise SessionGone(LOGIN_HINT) from error
 
 
+def _название(text):
+    """Название для сравнения: регистр и лишние пробелы не в счёт."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _кандидат(dialog):
+    """Строка про чат-кандидата: по ней владелец отличит один чат от другого."""
+    if getattr(dialog, "is_user", False):
+        вид = "личка"
+    else:
+        вид = "канал" if kind_of(dialog.entity) == "channel" else "группа"
+    участников = getattr(dialog.entity, "participants_count", None)
+    последнее = (getattr(getattr(dialog, "message", None), "message", "") or "").strip()
+    когда = dialog.date.strftime("%d.%m.%Y %H:%M") if getattr(dialog, "date", None) else "?"
+    части = [f"id {dialog.id}", вид]
+    if участников:
+        части.append(f"участников {участников}")
+    части.append(f"последнее {когда}")
+    if последнее:
+        части.append(f"«{последнее[:60]}»")
+    return ", ".join(части)
+
+
+async def чат_по_названию(app, название, chat_id=None):
+    """Чат по точному названию: закрытая группа без юзернейма или личка.
+
+    Ищется в момент отправки по диалогам и архиву. Похожий чат не подставляется
+    никогда: нет точного совпадения — отказ с похожими названиями в тексте.
+    Несколько чатов под одним названием — отказ с описанием каждого; тогда
+    вызывающий добавляет `chat_id`, и чат берётся, только если номер и название
+    указывают на один и тот же диалог. Голый номер по-прежнему не принимается:
+    вчерашние номера однажды увели переписку не туда.
+    """
+    искомое = _название(название)
+    if not искомое:
+        raise ValueError("не сказано, в какой чат писать: нужно название")
+    совпали, все = [], []
+    async for dialog, _ in dialogs(app):
+        все.append(dialog.name or "")
+        if _название(dialog.name) == искомое:
+            совпали.append(dialog)
+    if not совпали:
+        имена = {_название(n): n for n in все}
+        похожие = difflib.get_close_matches(искомое, имена, n=5, cutoff=0.6)
+        хвост = ("; похожие: " + ", ".join(f"«{имена[p]}»" for p in похожие)) if похожие else ""
+        raise ChatNotFound(f"чата «{название}» в диалогах нет{хвост}")
+    if chat_id is not None:
+        совпали = [d for d in совпали if int(d.id) == int(chat_id)]
+        if not совпали:
+            raise ChatNotFound(
+                f"чата «{название}» с номером {chat_id} нет: название и номер "
+                "указывают на разные чаты — номер мог смениться, отправка остановлена"
+            )
+    if len(совпали) > 1:
+        raise ChatAmbiguous(
+            f"под названием «{название}» {len(совпали)} чата — укажи номер вместе "
+            "с названием:\n" + "\n".join(_кандидат(d) for d in совпали)
+        )
+    (dialog,) = совпали
+    return Чат(id=dialog.id, title=dialog.name, entity=dialog.entity)
+
+
 # Отказы по юзернейму. Три разные беды, и лечатся они по-разному: опечатку
 # исправляют, в закрытый чат вступают, а человеку пишут в личку.
 NO_USERNAME = "юзернейма @{name} в Телеграме нет: проверь написание"
@@ -316,11 +357,45 @@ async def resolve_username(app, target):
     return str(get_peer_id(entity)), entity
 
 
+async def peer_by_username(app, target):
+    """Собеседник по юзернейму: пара «идентификатор, сущность». Человек тоже годится.
+
+    Отдельно от `resolve_username`, который людей отвергает намеренно: туда
+    ходит разбор чужих чатов, и человек там означал бы ошибку в команде. Здесь
+    наоборот — голосовые почти всегда лежат в личной переписке, и запрет на
+    человека закрыл бы главный случай.
+    """
+    name = username_of(target)
+    if not name:
+        raise ValueError(NO_NAME)
+    try:
+        entity = await app.get_entity(name)
+    except UnauthorizedError as error:
+        raise SessionGone(LOGIN_HINT) from error
+    except (UsernameNotOccupiedError, UsernameInvalidError) as error:
+        raise UsernameGone(NO_USERNAME.format(name=name)) from error
+    except ChannelPrivateError as error:
+        raise ChatClosed(CLOSED_CHAT.format(name=name)) from error
+    except ValueError as error:
+        raise UsernameGone(NO_USERNAME.format(name=name)) from error
+    if isinstance(entity, (ChannelForbidden, ChatForbidden)):
+        raise ChatClosed(CLOSED_CHAT.format(name=name))
+    return str(get_peer_id(entity)), entity
+
+
+def title_of(entity):
+    """Как назвать собеседника в выводе: название чата либо имя человека."""
+    title = getattr(entity, "title", None)
+    if title:
+        return title
+    parts = [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]
+    name = " ".join(part for part in parts if part)
+    return name or getattr(entity, "username", None) or str(getattr(entity, "id", ""))
+
+
 def kind_of(entity):
     """Канал или группа. Супергруппа для разбора — обычная группа."""
     return "channel" if getattr(entity, "broadcast", False) else "group"
-
-
 
 
 async def chats(app):
@@ -409,55 +484,20 @@ def _media_kind(message):
     return type(media).__name__
 
 
-def _speech_row(message, in_group):
-    """Одно сообщение так, как его читает разбор манеры речи.
+async def voices(app, entity, folder, since=None, limit=None, mine=True,
+                 notify=_silent, sleep=asyncio.sleep):
+    """Голосовые и кружки чата за окно, скачанные на диск.
 
-    Дословный текст обязателен: на нём держится и банк фраз, и проверка на
-    выдумки. Поэтому `strip` тут нет — отбивка пустой строкой внутри сообщения
-    это тоже манера.
+    Отдаёт по словарю на запись: номер сообщения, дата, направление,
+    длительность, путь к файлу. Файл качается сразу при встрече, потому что
+    второй обход ради вложений означал бы прочитать чат дважды.
+
+    `mine=False` оставляет только входящие: свой собственный голос расшифровывать
+    обычно незачем, а платим мы за каждую секунду.
     """
-    date = getattr(message, "date", None)
-    row = {
-        "mid": message.id,
-        "date": date.isoformat()[:16] if date else None,
-        "out": bool(getattr(message, "out", False)),
-        "text": getattr(message, "text", None) or getattr(message, "message", None) or "",
-    }
-    if getattr(message, "action", None) is not None:
-        row["service"] = True
-    if getattr(message, "fwd_from", None) is not None:
-        row["fwd"] = True
-    media = _media_kind(message)
-    if media:
-        row["media"] = media
-        seconds = _seconds(message)
-        if seconds is not None:
-            row["secs"] = seconds
-    reply_to = getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None)
-    if reply_to:
-        row["reply_to"] = reply_to
-    if in_group:
-        name, username = _author(message)
-        row["from"] = name
-        row["from_username"] = username
-        sender_id = getattr(message, "sender_id", None)
-        if sender_id is not None:
-            row["from_id"] = str(sender_id)
-    return row
-
-
-async def speech(app, entity, since=None, in_group=False, notify=_silent, sleep=asyncio.sleep):
-    """Сообщения чата за окно в виде, годном для разбора манеры речи.
-
-    От `fetch` отличается тем, что сохраняется: направление, пересылка,
-    служебность, вид вложения. Отсев мусора здесь не делается — что считать
-    мусором, решает разбор, а выгрузка обязана быть полной.
-
-    Флуд-лимит не отбрасывает уже прочитанное: обход продолжается с того
-    сообщения, на котором встал. Годовой обход по чату на десять тысяч
-    сообщений иначе начинался бы заново с каждой паузы.
-    """
-    rows = []
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    found = []
     offset = 0
     waits = 0
     while True:
@@ -466,13 +506,24 @@ async def speech(app, entity, since=None, in_group=False, notify=_silent, sleep=
                 offset = message.id
                 date = getattr(message, "date", None)
                 if since and date and date < since:
-                    return rows
-                rows.append(_speech_row(message, in_group))
-                # Переписка на десятки тысяч сообщений читается минутами. Без
-                # отметок обход неотличим от зависшего, и его убивают руками.
-                if len(rows) % SPEECH_MARK == 0:
-                    notify(f"прочитано {len(rows)}, дошли до {str(date)[:10]}")
-            return rows
+                    return found
+                if _media_kind(message) not in ("голосовое", "кружок"):
+                    continue
+                if not mine and getattr(message, "out", False):
+                    continue
+                path = await message.download_media(file=str(folder))
+                found.append({
+                    "mid": message.id,
+                    "date": date.isoformat()[:16] if date else None,
+                    "out": bool(getattr(message, "out", False)),
+                    "secs": _seconds(message),
+                    "kind": _media_kind(message),
+                    "path": path,
+                })
+                notify(f"скачано {len(found)}: {str(date)[:10]}, {_seconds(message)} с")
+                if limit and len(found) >= limit:
+                    return found
+            return found
         except FloodWaitError as error:
             if error.seconds > FLOOD_LIMIT or waits >= FLOOD_RETRIES:
                 raise FloodStop(
@@ -487,43 +538,6 @@ async def speech(app, entity, since=None, in_group=False, notify=_silent, sleep=
             ) from error
         except UnauthorizedError as error:
             raise SessionGone(LOGIN_HINT) from error
-
-
-async def lengths(app, entity, ids, notify=_silent, sleep=asyncio.sleep):
-    """Длительность голосовых по номерам сообщений: пары «номер, секунды».
-
-    Спрашивается отдельно от выгрузки и по номерам, а не обходом: длительность
-    понадобилась после того, как год уже прочитан, и читать его заново ради
-    одного поля значило бы сорок минут работы вместо минуты. Телеграм отдаёт до
-    сотни сообщений за запрос.
-    """
-    found = {}
-    for start in range(0, len(ids), IDS_PER_CALL):
-        chunk = ids[start : start + IDS_PER_CALL]
-        while True:
-            try:
-                messages = await app.get_messages(entity, ids=chunk)
-                break
-            except FloodWaitError as error:
-                if error.seconds > FLOOD_LIMIT:
-                    raise FloodStop(
-                        f"Телеграм просит подождать {error.seconds} с — чат отложен"
-                    ) from error
-                notify(f"флуд-лимит: ждём {error.seconds} с")
-                await sleep(error.seconds + 2)
-            except UnauthorizedError as error:
-                raise SessionGone(LOGIN_HINT) from error
-        for message in messages:
-            # Удалённое сообщение приходит пустым местом: номер есть, объекта нет.
-            if message is None:
-                continue
-            document = getattr(message, "document", None)
-            for attribute in getattr(document, "attributes", ()) or ():
-                seconds = getattr(attribute, "duration", None)
-                if seconds is not None:
-                    found[message.id] = int(seconds)
-                    break
-    return found
 
 
 async def _filters(app):
@@ -595,30 +609,6 @@ async def add_to_folder(app, number, chats):
     return len(folder.include_peers)
 
 
-async def _topics(app, entity):
-    """Темы форумной группы: номер -> название. Обычный чат тем не имеет."""
-    if not getattr(entity, "forum", False):
-        return None
-    result = await app(
-        GetForumTopicsRequest(
-            peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=TOPIC_LIMIT
-        )
-    )
-    return {
-        topic.id: topic.title
-        for topic in getattr(result, "topics", [])
-        if getattr(topic, "title", None)
-    }
-
-
-def _migration(rows, action):
-    """Служебное сообщение о переезде: новый идентификатор нужен состоянию."""
-    if isinstance(action, MessageActionChatMigrateTo):
-        rows.migrated_to = str(get_peer_id(PeerChannel(action.channel_id)))
-    elif isinstance(action, MessageActionChannelMigrateFrom):
-        rows.migrated_from = str(get_peer_id(PeerChat(action.chat_id)))
-
-
 def _author(message):
     """Имя и юзернейм. У анонимного админа вместо имени его подпись."""
     try:
@@ -635,256 +625,6 @@ def _author(message):
     if not name:
         name = getattr(message, "post_author", None)
     return name or None, username
-
-
-def _thread(message, topics):
-    """Номер родителя и название темы. В форуме корень темы ответом не считается."""
-    head = getattr(message, "reply_to", None)
-    reply_to = getattr(head, "reply_to_msg_id", None)
-    if topics is None or head is None or not getattr(head, "forum_topic", False):
-        return reply_to, None
-    top = getattr(head, "reply_to_top_id", None)
-    if top:
-        return reply_to, topics.get(top)
-    return None, topics.get(reply_to)
-
-
-def _reactions(message):
-    """Сколько реакций собрало сообщение — всеми эмодзи разом.
-
-    Telethon отдаёт их объектом `MessageReactions` в поле `reactions`, а внутри —
-    список `ReactionCount` со своим счётчиком на каждую эмодзи. Реакций может не
-    быть вовсе, и тогда поля нет: `None` здесь обычнее объекта.
-
-    Считаем сумму, а какими эмодзи откликались — нет: в отчёте это число
-    конкуренции за заказ, а не настроение читателей.
-    """
-    counts = getattr(getattr(message, "reactions", None), "results", None) or ()
-    return sum(getattr(item, "count", 0) or 0 for item in counts)
-
-
-# Через сколько прочитанных сообщений подавать голос. Чат на десятки тысяч
-# сообщений читается часами, и без отметок работающий обход неотличим от
-# повисшего — на этом в проекте уже убили живой прогон руками.
-WALK_MARK = 2000
-
-
-async def _walk(app, entity, since, until, limit, min_id, topics, notify=_silent):
-    """Один проход по чату. Флуд-лимит наверх, разбор строк здесь."""
-    rows = Rows()
-    seen = 0
-    async for message in app.iter_messages(entity, limit=limit, min_id=min_id):
-        seen += 1
-        if seen % WALK_MARK == 0:
-            # Дата важнее счёта: по ней видно, сколько окна осталось пройти.
-            дошли = getattr(message, "date", None)
-            notify(f"прочитано {seen}, дошли до {дошли.date() if дошли else 'неизвестно'}")
-        date = getattr(message, "date", None)
-        if since and date and date < since:
-            break
-        action = getattr(message, "action", None)
-        if action is not None:
-            _migration(rows, action)
-            continue
-        if until and date and date > until:
-            continue
-        # Подпись к картинке, голосовому или опросу лежит в том же поле, что и
-        # текст: `Message.text` отдаёт `Message.message` через разметку клиента.
-        # У сообщения без клиента это свойство пустое, поэтому подпись берётся
-        # из `message` — иначе она молча пропадёт.
-        text = (getattr(message, "text", None) or getattr(message, "message", None) or "").strip()
-        reply_to, topic = _thread(message, topics)
-        if topic:
-            text = f"[тема: {topic}] {text}".strip()
-        name, username = _author(message)
-        comments = getattr(getattr(message, "replies", None), "replies", None)
-        row = {
-            "mid": message.id,
-            "date": date.isoformat()[:16] if date else None,
-            "from": name,
-            "username": username,
-            "reply_to": reply_to,
-            "comments": comments or 0,
-            "reactions": _reactions(message),
-            # Сообщение без текста место в ленте держит: номер нужен разметке.
-            "text": text,
-        }
-        # Просмотры Телеграм считает только постам каналов. В группе их нет вовсе,
-        # и `"views": null` в каждой строке выгрузки — это вес без сведений.
-        views = getattr(message, "views", None)
-        if views is not None:
-            row["views"] = views
-        rows.append(row)
-    return rows
-
-
-async def fetch(
-    app,
-    entity,
-    since=None,
-    until=None,
-    limit=4000,
-    min_id=0,
-    notify=_silent,
-    sleep=asyncio.sleep,
-):
-    """Сообщения чата за окно. Флуд-лимит пережидается один раз."""
-    waited = False
-    while True:
-        try:
-            topics = await _topics(app, entity)
-            return await _walk(app, entity, since, until, limit, min_id, topics, notify)
-        except FloodWaitError as error:
-            if waited:
-                raise FloodStop(
-                    f"Телеграм просит подождать ещё {error.seconds} с — чат отложен"
-                ) from error
-            if error.seconds > FLOOD_LIMIT:
-                raise FloodStop(
-                    f"Телеграм просит подождать {error.seconds} с, это больше {FLOOD_LIMIT} —"
-                    " чат отложен"
-                ) from error
-            notify(f"флуд-лимит: ждём {error.seconds} с и читаем чат заново")
-            await sleep(error.seconds + 2)
-            waited = True
-        except ChannelPrivateError as error:
-            # Сущность взялась, а сообщения не отдают: чат закрыли или нас из
-            # него убрали. «Телеграм отказал» тут ничего владельцу не говорит.
-            raise ChatClosed(
-                "Телеграм не отдаёт сообщения: чат закрыт или нас из него убрали"
-            ) from error
-        except UnauthorizedError as error:
-            raise SessionGone(LOGIN_HINT) from error
-
-
-def _linked(full):
-    """Группа обсуждения из полных сведений о канале."""
-    linked = getattr(getattr(full, "full_chat", None), "linked_chat_id", None)
-    if not linked:
-        return None
-    title = None
-    username = None
-    for chat in getattr(full, "chats", []):
-        if getattr(chat, "id", None) == linked:
-            title = getattr(chat, "title", None)
-            username = getattr(chat, "username", None)
-    return {"id": str(get_peer_id(PeerChannel(linked))), "title": title, "username": username}
-
-
-async def discussion(app, channel):
-    """Группа обсуждения канала: отклики на посты лежат там, а не под постом."""
-    return _linked(await app(GetFullChannelRequest(channel)))
-
-
-def write_access(entity):
-    """Можно ли писать в чат — до того, как в него вступили.
-
-    Вопрос стоит рядом с «что за чат»: в канале-агрегаторе постят только админы,
-    и предлагать там услуги некому. Права участника Телеграм отдаёт вместе с
-    сущностью, отдельной просьбы для них не нужно.
-    """
-    if getattr(entity, "broadcast", False):
-        if getattr(entity, "creator", False) or getattr(entity, "admin_rights", None):
-            return WRITE_OPEN
-        return WRITE_ADMINS
-    banned = getattr(entity, "default_banned_rights", None)
-    if getattr(banned, "send_messages", False):
-        return WRITE_BANNED
-    if getattr(entity, "left", False):
-        return WRITE_JOIN
-    return WRITE_OPEN
-
-
-async def _full(app, entity):
-    """Полные сведения о чате. У обычной группы и у канала разные запросы."""
-    if isinstance(entity, Chat):
-        return await app(GetFullChatRequest(entity.id))
-    return await app(GetFullChannelRequest(entity))
-
-
-async def _pinned_text(app, entity, mid):
-    """Текст закреплённого сообщения: в нём обычно и лежат правила про рекламу.
-
-    Закреп может не отдаться — тогда его просто нет. Ронять из-за него всю
-    справку о чате нельзя: остальное в ней важнее.
-    """
-    if not mid:
-        return None
-    try:
-        message = await app.get_messages(entity, ids=mid)
-    except Exception:
-        return None
-    text = (getattr(message, "text", None) or getattr(message, "message", None) or "").strip()
-    if len(text) > PINNED_LIMIT:
-        text = text[:PINNED_LIMIT].rstrip() + "…"
-    return text or None
-
-
-async def about(app, entity):
-    """Всё о чате, что видно до выгрузки: люди, описание, правила, куда откликаться.
-
-    Это первый вопрос о незнакомом чате — «что там и стоит ли туда идти», — и
-    отвечать на него разбором за деньги незачем: Телеграм отдаёт всё это даром.
-    """
-    try:
-        full = await _full(app, entity)
-    except UnauthorizedError as error:
-        raise SessionGone(LOGIN_HINT) from error
-    except ChannelPrivateError as error:
-        raise ChatClosed(
-            CLOSED_CHAT.format(name=getattr(entity, "username", None) or getattr(entity, "id", ""))
-        ) from error
-    inside = getattr(full, "full_chat", None)
-    linked = _linked(full)
-    description = (getattr(inside, "about", None) or "").strip()
-    broadcast = bool(getattr(entity, "broadcast", False))
-    return {
-        "id": str(get_peer_id(entity)),
-        "title": getattr(entity, "title", None),
-        "username": getattr(entity, "username", None),
-        "kind": kind_of(entity),
-        "forum": bool(getattr(entity, "forum", False)),
-        "participants": (
-            getattr(inside, "participants_count", None)
-            or getattr(entity, "participants_count", None)
-        ),
-        "online": getattr(inside, "online_count", None),
-        "description": description or None,
-        "pinned": await _pinned_text(app, entity, getattr(inside, "pinned_msg_id", None)),
-        "linked": linked,
-        # Тот же расклад, что и в выгрузке, но без второго запроса: связанную
-        # группу мы только что видели в тех же полных сведениях.
-        "replies": (
-            REPLIES_THREAD if not broadcast
-            else REPLIES_COMMENTS if linked
-            else REPLIES_NONE
-        ),
-        "write": write_access(entity),
-        "joined": not getattr(entity, "left", False),
-        "slowmode": getattr(inside, "slowmode_seconds", None) or None,
-    }
-
-
-async def replies_kind(app, entity):
-    """Где по этому чату виден отклик на заказ. Считается один раз на чат.
-
-    Обычная группа — отвечают в тред, отклики на виду. Канал с привязанной
-    группой обсуждения — отклики лежат комментариями, и Телеграм считает их сам.
-    Канал без обсуждения — откликнуться в Телеграме негде: контакт даётся в
-    тексте поста, а пишут ему в личку, и увидеть эти отклики нельзя ничем.
-
-    Телеграм отказал — возвращается None: «обсуждения нет» здесь было бы
-    выдумкой, а отчёт по такой выдумке объявил бы отклики невидимыми.
-    """
-    if not getattr(entity, "broadcast", False):
-        return REPLIES_THREAD
-    try:
-        linked = await discussion(app, entity)
-    except UnauthorizedError as error:
-        raise SessionGone(LOGIN_HINT) from error
-    except Exception:
-        return None
-    return REPLIES_COMMENTS if linked else REPLIES_NONE
 
 
 async def search_public(app, query, limit=50):
@@ -990,56 +730,13 @@ def window(days=None, since=None, until=None):
     return start, end
 
 
-async def say(app, кому, текст, про=""):
-    """Отправить сообщение. Адресат — юзернейм, а не число.
+def __getattr__(name):
+    """`telegram.say` и `telegram.KnownBot` — отправка из `outbox`.
 
-    Числовые идентификаторы едут после каждой выгрузки, и подстановка
-    вчерашних однажды увела шесть чужих чатов с личной перепиской в стороннюю
-    модель. Юзернейм не меняется.
-
-    Пустое сообщение — ошибка вызова, а не повод дёргать Телеграм: отправку
-    отменить нельзя, и лишний запрос к аккаунту владельца тут ни к чему.
-
-    **Чёрный список приманок сверяется здесь, а не у вызывающего.** 08.09.2026
-    два пинга ушли ботам, лежавшим в списке с 02.09: правило «перед любым
-    исходящим сверяться» жило в памяти агента, и разовый скрипт проверил не тот
-    ключ. Это единственная дверь наружу, поэтому сверка стоит в ней: обойти её
-    можно только сознательно. Список не читается — не уходит никто: сломанная
-    проверка хуже отсутствующей.
-
-    **Журнал отправок пишется здесь же**, после того как Телеграм принял
-    сообщение: время, адресат, дословный текст, номер сообщения. `про` — о
-    чём письмо, одной строкой. Строка руками не дублируется.
+    По этому адресу её зовут скрипты и инструкции. Модуль отправки сам
+    опирается на этот, поэтому берётся при первом обращении, а не при импорте.
     """
-    if not (текст or "").strip():
-        raise ValueError("отправлять нечего: текст пуст")
-    if str(кому).strip().lstrip("-").isdigit():
-        # Правило из докстринга, теперь и в коде: число принималось молча, а
-        # защита от повторения дорогого инцидента жила только в прозе.
-        raise ValueError(
-            f"адресат «{кому}» — число, а отправка идёт только по юзернейму:"
-            " числовые идентификаторы едут после каждой выгрузки"
-        )
-    # Импорт внутри: `discovery.orders` сам импортирует этот модуль ради
-    # ссылок на сообщения, а слой разведки ниже клиента. Сверка всё равно
-    # должна стоять у двери, поэтому цикл разорван здесь, а не убран.
-    from .discovery import orders
-    запись = orders.запись_бота(username_of(кому))
-    if запись:
-        raise KnownBot(
-            f"адресат «{кому}» — бот-приманка {запись['username']}, в чёрном "
-            f"списке с {запись.get('подтверждён', '?')}: {запись.get('чем', '')}"
-        )
-    try:
-        отправлено = await app.send_message(кому, текст)
-    except UnauthorizedError as error:
-        raise SessionGone(LOGIN_HINT) from error
-    except FloodWaitError as error:
-        raise FloodStop(f"Телеграм просит подождать: {error}") from error
-    except PeerFloodError as error:
-        raise SpamRestricted(
-            "аккаунт ограничен за рассылку — отправка недоступна"
-        ) from error
-    orders.записать_отправку(username_of(кому), текст, про=про,
-                             message_id=getattr(отправлено, "id", None))
-    return отправлено
+    if name in ("say", "KnownBot"):
+        from . import outbox
+        return getattr(outbox, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

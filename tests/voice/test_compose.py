@@ -454,7 +454,7 @@ def test_the_patch_glues_back_into_a_backticked_quote():
 
     вышло = compose.impersonal(файл, правки)
 
-    assert "Асхат" not in вышло
+    assert "Бахыт" not in вышло
     assert вышло.startswith("`2026-02-06 02:58 я: <имя>")
 
 
